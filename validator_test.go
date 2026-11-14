@@ -86,6 +86,46 @@ func TestTokenEquals(t *testing.T) {
 	require.False(t, tokenEquals(nonToken, nonToken), "Non-token types should never equal")
 }
 
+func TestTokenEqualsNamespaces(t *testing.T) {
+	// faithful round trips through the encoder are equal, even if the
+	// encoder rewrote namespace prefixes along the way
+	faithful := [][2]string{
+		// element prefixes turn into a leading default xmlns attribute
+		{`<x:Root xmlns:x="urn:1"/>`, `<Root xmlns="x" xmlns:_xmlns="xmlns" _xmlns:x="urn:1"/>`},
+		// two different prefixes bound to the same URI
+		{`<Root xmlns:a="urn:1" xmlns:b="urn:1" a:x="1" b:y="2"/>`,
+			`<Root xmlns:_xmlns="xmlns" _xmlns:a="urn:1" _xmlns:b="urn:1" xmlns:a="a" a:x="1" xmlns:b="b" b:y="2"/>`},
+		// xmlns declarations after the attributes they belong to
+		{`<Root a:x="1" xmlns:a="urn:1"/>`, `<Root xmlns:a="a" a:x="1" xmlns:_xmlns="xmlns" _xmlns:a="urn:1"/>`},
+		// a default namespace rewritten by an erased element prefix
+		{`<x:Root xmlns="x"/>`, `<Root xmlns="x" xmlns="x"/>`},
+		// declarations named like the encoder's generated prefixes
+		{`<Root xmlns:xmlns="urn:1" a:attr="1"/>`, `<Root xmlns:_xmlns="xmlns" _xmlns:xmlns="urn:1" xmlns:a="a" a:attr="1"/>`},
+	}
+	for _, pair := range faithful {
+		require.True(t, tokenEquals(tokenize(t, pair[0]), tokenize(t, pair[1])),
+			"Faithful round trip of %s should equal %s", pair[0], pair[1])
+	}
+
+	// tokens that merely look alike are not equal
+	different := [][2]string{
+		// same URI, but the attribute's prefix identity differs
+		{`<Root xmlns:a="urn:1" a:x="1"/>`, `<Root xmlns:_xmlns="xmlns" _xmlns:a="urn:1" xmlns:b="b" b:x="1"/>`},
+		// declaration value does not match the original prefix
+		{`<Root xmlns:a="urn:1" a:x="1"/>`, `<Root xmlns:_xmlns="xmlns" _xmlns:a="urn:1" xmlns:a="urn:2" a:x="1"/>`},
+		// same attributes, different order
+		{`<Root xmlns:a="urn:1" a:x="1" a:y="2"/>`, `<Root xmlns:_xmlns="xmlns" _xmlns:a="urn:1" xmlns:a="a" a:y="2" a:x="1"/>`},
+		// erased element prefix does not match the default xmlns value
+		{`<x:Root xmlns="y"/>`, `<Root xmlns="z" xmlns="y"/>`},
+		// prefixed attribute without a matching declaration
+		{`<Root a:x="1"/>`, `<Root xmlns:_xmlns="xmlns" _xmlns:a="urn:1" b:x="1"/>`},
+	}
+	for _, pair := range different {
+		require.False(t, tokenEquals(tokenize(t, pair[0]), tokenize(t, pair[1])),
+			"%s should not equal %s", pair[0], pair[1])
+	}
+}
+
 func TestErrorMessages(t *testing.T) {
 	require.Equal(t, "validator: in token starting at 2:16: unexpected EOF",
 		XMLValidationError{34, 54, 2, 16, io.ErrUnexpectedEOF}.Error(),

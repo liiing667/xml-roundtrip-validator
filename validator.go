@@ -231,59 +231,104 @@ func tokenEquals(before, after xml.Token) bool {
 		if !ok {
 			return false
 		}
-		// encoding/xml messes up namespace prefixes on both tag and attribute names;
-		// they need adjusting to make the comparison possible
-		fixNamespacePrefixes(&t1, &t2)
-		if t1.Name != t2.Name {
-			return false
-		}
-		if len(t1.Attr) != len(t2.Attr) {
-			return false
-		}
-		// after the call to fixNamespacePrefixes, all attributes should match;
-		// ordering is preserved
-		for i, attr := range t1.Attr {
-			if attr != t2.Attr[i] {
-				return false
-			}
-		}
-		return true
+		return startElementsEqual(t1, t2)
 	}
 	return false
 }
 
-func fixNamespacePrefixes(before, after *xml.StartElement) {
-	// if the after token has more attributes than the before token,
-	// the round trip likely introduced new xmlns attributes
-	if len(after.Attr) > len(before.Attr) {
-		// handle erased tag prefixes; the corresponding xmlns attribute is always the first one
-		if (before.Name.Space != "" && after.Name.Space == "" && after.Attr[0].Name == xml.Name{Local: "xmlns"}) {
-			after.Name.Space = after.Attr[0].Value
-			after.Attr = after.Attr[1:]
-		}
+// xmlNamespace is the namespace URI bound to the reserved "xml" prefix
+const xmlNamespace = "http://www.w3.org/XML/1998/namespace"
 
-		// handle attribute prefixes; the xmlns attribute always comes immediately before the prefixed attribute
-		for len(after.Attr) > len(before.Attr) && len(after.Attr) > 1 {
-			var xmlns *xml.Attr
-			i := 1
-			for ; i < len(after.Attr); i++ {
-				if after.Attr[i-1].Name.Space == "xmlns" && after.Attr[i-1].Name.Local == after.Attr[i].Name.Space {
-					xmlns = &after.Attr[i-1]
-					break
-				}
-			}
-			if xmlns == nil {
-				break
-			}
-			prefix := xmlns.Name.Local
-			space := xmlns.Value
-			copy(after.Attr[i-1:], after.Attr[i:])
-			after.Attr = after.Attr[:len(after.Attr)-1]
-			for j := range after.Attr {
-				if after.Attr[j].Name.Space == prefix {
-					after.Attr[j].Name.Space = space
-				}
-			}
+// startElementsEqual compares two start elements in a namespace-aware manner.
+// The encoder rewrites namespaces deterministically: an element prefix turns
+// into a leading default xmlns attribute holding the prefix as its value, and
+// every attribute prefix is replaced by a generated prefix declared through an
+// xmlns attribute emitted right before the first attribute using it. Instead
+// of guessing prefixes, this function resolves those declarations back to the
+// namespaces they bind and compares URI and local name of the tag and of every
+// attribute, preserving prefix identity and attribute order.
+func startElementsEqual(before, after xml.StartElement) bool {
+	if before.Name == after.Name && attrsEqual(before.Attr, after.Attr) {
+		return true
+	}
+	if before.Name.Local != after.Name.Local {
+		return false
+	}
+	afterAttrs := after.Attr
+	switch {
+	case before.Name.Space == after.Name.Space:
+		// same namespace on both sides; nothing to resolve
+	case before.Name.Space != "" && after.Name.Space == "":
+		// an encoded element prefix shows up as a leading default xmlns
+		// attribute holding the prefix as its value
+		if len(afterAttrs) == 0 ||
+			afterAttrs[0].Name != (xml.Name{Local: "xmlns"}) ||
+			afterAttrs[0].Value != before.Name.Space {
+			return false
+		}
+		afterAttrs = afterAttrs[1:]
+	default:
+		return false
+	}
+	resolved, ok := resolveEncodedAttrs(afterAttrs)
+	if !ok {
+		return false
+	}
+	return attrsEqual(before.Attr, resolved)
+}
+
+func attrsEqual(a, b []xml.Attr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
+	return true
+}
+
+// resolveEncodedAttrs maps the attributes of an encoded start element back to
+// the namespaces their prefixes are bound to. Encoder-generated xmlns
+// declarations are dropped after resolving every prefixed attribute to the
+// namespace URI its prefix is bound to; all other attributes keep their
+// identity and order. It returns false if the attributes cannot be the result
+// of encoding a token, e.g. when a prefixed attribute has no matching
+// declaration or a prefix is declared twice.
+func resolveEncodedAttrs(attrs []xml.Attr) ([]xml.Attr, bool) {
+	bindings := map[string]string{}
+	resolved := make([]xml.Attr, 0, len(attrs))
+	for i, attr := range attrs {
+		if attr.Name.Space == "xmlns" && attr.Name.Local != "" &&
+			i+1 < len(attrs) && attrs[i+1].Name.Space == attr.Name.Local {
+			// generated declaration, emitted right before the first
+			// attribute using the generated prefix
+			prefix := attr.Name.Local
+			if _, ok := bindings[prefix]; ok {
+				return nil, false
+			}
+			bindings[prefix] = attr.Value
+			continue
+		}
+		resolved = append(resolved, attr)
+	}
+	for i := range resolved {
+		switch resolved[i].Name.Space {
+		case "", "xmlns":
+			// no namespace, or a namespace declaration of the original
+			// token; keep the attribute as is
+		case "xml":
+			// the encoder uses the reserved xml prefix for the XML
+			// namespace without emitting a declaration
+			resolved[i].Name.Space = xmlNamespace
+		default:
+			namespace, ok := bindings[resolved[i].Name.Space]
+			if !ok {
+				return nil, false
+			}
+			resolved[i].Name.Space = namespace
+		}
+	}
+	return resolved, true
 }
